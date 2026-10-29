@@ -1,0 +1,18 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WhatsApp MCP – QR</title>
+<style>
+  body { font: 16px -apple-system, sans-serif; text-align: center; padding: 32px; background: #fff; color: #111; }
+  img { width: 360px; max-width: 90vw; image-rendering: pixelated; }
+</style>
+<h2>Scan with WhatsApp</h2>
+<p>Phone → Settings → Linked devices → Link a device</p>
+<img id="qr" alt="">
+<p id="msg">The code refreshes on its own every ~20 s.</p>
+<script>
+  const img = document.getElementById('qr'), msg = document.getElementById('msg');
+  img.onerror = () => { img.style.display = 'none'; msg.textContent = 'No pending QR code — probably already linked. Check with: wa status'; };
+  img.onload = () => { img.style.display = ''; msg.textContent = 'The code refreshes on its own every ~20 s.'; };
+  const load = () => { img.src = 'store/qr.png?t=' + Date.now(); };
+  load(); setInterval(load, 3000);
+</script>

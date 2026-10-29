@@ -1,8 +1,9 @@
 [project]
 name = "whatsapp-mcp-server"
 version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
+description = "MCP server for your personal WhatsApp account: read and search chats, send messages and download media"
+readme = "../README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.28.1",

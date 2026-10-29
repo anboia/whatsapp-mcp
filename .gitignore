@@ -1,3 +1,33 @@
+# WhatsApp session keys, message history and downloaded media. Never commit these:
+# whatsapp.db holds the credentials of your linked device.
+whatsapp-bridge/store/
+store/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak*
+qr.png
+
+# Compiled bridge binary
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-bridge.exe
+
+# Media exports (manifest.csv / manifest.json and copied files)
+.manifest.lock
+
+# Local configuration and logs
 claude_desktop_config.json
-whatsapp.log
+.env
+.env.*
+*.log
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/

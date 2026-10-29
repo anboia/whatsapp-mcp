@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional
+import anyio
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -12,7 +13,9 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    export_chat_media as whatsapp_export_chat_media,
+    request_chat_backfill as whatsapp_request_chat_backfill
 )
 
 # Initialize FastMCP server
@@ -222,8 +225,11 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     }
 
 @mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
+async def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
+
+    The file is checked against the SHA-256 in the message. If the media expired on the
+    WhatsApp servers, the bridge asks the phone to upload it again (the phone must be online).
     
     Args:
         message_id: The ID of the message containing the media
@@ -232,19 +238,64 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
+    # In a worker thread, so a long download doesn't block the other tools
+    file_path, status_message = await anyio.to_thread.run_sync(whatsapp_download_media, message_id, chat_jid)
     
     if file_path:
         return {
             "success": True,
-            "message": "Media downloaded successfully",
+            "message": status_message,
             "file_path": file_path
         }
     else:
         return {
             "success": False,
-            "message": "Failed to download media"
+            "message": status_message
         }
+
+@mcp.tool()
+async def download_chat_media(
+    chat_jid: str,
+    dest_dir: Optional[str] = None,
+    media_types: Optional[List[str]] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    media_retry: bool = True,
+) -> Dict[str, Any]:
+    """Download all photos, audios, videos and documents of a chat.
+
+    Files are verified against the SHA-256 in each message. With dest_dir, they are also
+    copied there as read-only files, with manifest.csv and manifest.json listing date,
+    sender, caption, size and SHA-256 of each one. Running it again only adds new files.
+
+    Args:
+        chat_jid: The JID of the chat (e.g. 123456789@g.us)
+        dest_dir: Optional ABSOLUTE folder (or ~/...) to copy the files to, e.g. ~/whatsapp-export.
+            Several chats can share a folder: each manifest row records its chat.
+        media_types: Optional subset of ["image", "audio", "video", "document"]
+        after: Optional ISO-8601 date with timezone; only media from this moment on
+        before: Optional ISO-8601 date with timezone; only media before this moment
+        media_retry: Ask the phone to re-upload media that expired on the WhatsApp servers
+            (default True; the phone must be online, and an unanswered request stops further retries)
+    """
+    return await anyio.to_thread.run_sync(
+        whatsapp_export_chat_media, chat_jid, dest_dir, media_types, after, before, media_retry
+    )
+
+@mcp.tool()
+def request_chat_backfill(chat_jid: str, count: int = 100) -> Dict[str, Any]:
+    """Ask the linked phone to resend a chat's recent history to the bridge.
+
+    Fills captions, sender JIDs, forwarded flags and download paths that older bridge
+    versions did not record. It is a request to the user's own phone (nothing is sent to
+    the chat). Messages arrive over the next seconds; run download_chat_media afterwards.
+
+    Args:
+        chat_jid: The JID of the chat
+        count: How many messages to ask for (default 100, max 500)
+    """
+    success, message = whatsapp_request_chat_backfill(chat_jid, count)
+    return {"success": success, "message": message}
 
 if __name__ == "__main__":
     # Initialize and run the server

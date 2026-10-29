@@ -1,14 +1,27 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
+import csv
+import hashlib
 import os.path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 import requests
 import json
 import audio
 
+try:
+    import fcntl
+except ImportError:  # Windows: exports into one folder are not serialized
+    fcntl = None
+
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
+WHATSAPP_API_BASE_URL = f"http://127.0.0.1:{os.environ.get('WHATSAPP_BRIDGE_PORT', '8741')}/api"
 
 @dataclass
 class Message:
@@ -81,8 +94,7 @@ def get_sender_name(sender_jid: str) -> str:
         
         if result and result[0]:
             return result[0]
-        else:
-            return sender_jid
+        return contact_name(sender_jid) or sender_jid
         
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
@@ -724,44 +736,419 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def download_media(message_id: str, chat_jid: str) -> Optional[str]:
-    """Download media from a message and return the local file path.
-    
+def _bridge_error(response: requests.Response) -> str:
+    try:
+        return response.json().get("message") or f"HTTP {response.status_code}"
+    except ValueError:
+        return f"HTTP {response.status_code}: {response.text.strip()[:200]}"
+
+
+def download_media(message_id: str, chat_jid: str) -> Tuple[Optional[str], str]:
+    """Download media from a message.
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
-        The local file path if download was successful, None otherwise
+        (local file path or None, status message from the bridge)
     """
     try:
-        url = f"{WHATSAPP_API_BASE_URL}/download"
-        payload = {
-            "message_id": message_id,
-            "chat_jid": chat_jid
-        }
-        
-        response = requests.post(url, json=payload)
-        
-        if response.status_code == 200:
-            result = response.json()
-            if result.get("success", False):
-                path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
-                return path
-            else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
-                return None
-        else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
-            return None
-            
+        # A phone re-upload plus a large file can take minutes; the bridge finishes the download
+        # even if this gives up, and the next call returns the file from its store
+        response = requests.post(
+            f"{WHATSAPP_API_BASE_URL}/download",
+            json={"message_id": message_id, "chat_jid": chat_jid},
+            timeout=(5, 1900),
+        )
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        return None, f"Request error: {e}"
+    if response.status_code != 200:
+        return None, _bridge_error(response)
+    try:
+        result = response.json()
+    except ValueError:
+        return None, f"Unexpected response from the bridge: {response.text[:200]}"
+    if result.get("success", False):
+        return result.get("path"), result.get("message", "Media downloaded successfully")
+    return None, result.get("message", "Unknown error")
+
+
+def request_chat_backfill(chat_jid: str, count: int = 100) -> Tuple[bool, str]:
+    """Ask the phone to resend a chat's recent history so the bridge can fill captions,
+    sender JIDs and download paths of messages stored by older versions."""
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/backfill", json={"chat_jid": chat_jid, "count": count}, timeout=(5, 60))
+    except requests.RequestException as e:
+        return False, f"Request error: {e}"
+    if response.status_code != 200:
+        return False, _bridge_error(response)
+    result = response.json()
+    return bool(result.get("success")), result.get("message", "")
+
+
+def _sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def contact_name(user_or_jid: str) -> Optional[str]:
+    """Name of a phone number or LID from the bridge's contact store (whatsapp.db)."""
+    user = user_or_jid.split("@")[0].split(":")[0]
+    if not user:
         return None
-    except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+    try:
+        conn = sqlite3.connect(f"file:{WHATSMEOW_DB_PATH}?mode=ro", uri=True)
+        try:
+            cursor = conn.cursor()
+            users = {user}
+            cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ? UNION SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (user, user))
+            users.update(row[0] for row in cursor.fetchall() if row[0])
+            jids = [f"{u}@{server}" for u in users for server in ("s.whatsapp.net", "lid")]
+            cursor.execute(
+                f"SELECT full_name, push_name, business_name FROM whatsmeow_contacts WHERE their_jid IN ({','.join('?' * len(jids))})",
+                jids,
+            )
+            for full_name, push_name, business_name in cursor.fetchall():
+                for name in (full_name, push_name, business_name):
+                    if name:
+                        return name
+        finally:
+            conn.close()
+    except sqlite3.Error:
         return None
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        return None
+    return None
+
+
+def _media_duration(path: str) -> Any:
+    """Duration in whole seconds read with ffprobe, or "" when it isn't available."""
+    ffprobe = shutil.which("ffprobe") or "/opt/homebrew/bin/ffprobe"
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return round(float(out)) if out else ""
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+
+MANIFEST_FIELDS = [
+    "chat_jid", "chat_name", "message_id", "timestamp", "sender", "sender_id", "from_me",
+    "media_type", "mime_type", "duration_s", "forwarded", "caption", "original_name", "file",
+    "size", "sha256", "media_retry", "exported_at", "status", "note", "replaced_at", "moved_aside",
+]
+
+# Shown in the CSV when the bridge that stored the message did not record the caption yet
+CAPTION_UNKNOWN = "(not recorded)"
+
+
+def _full_jid(sender_id: str) -> str:
+    """Give a bare user part its server when the contact store says which one it is.
+    Unknown values stay bare rather than being guessed into a phone number."""
+    if not sender_id or "@" in sender_id:
+        return sender_id
+    try:
+        conn = sqlite3.connect(f"file:{WHATSMEOW_DB_PATH}?mode=ro", uri=True)
+        try:
+            if conn.execute("SELECT 1 FROM whatsmeow_lid_map WHERE lid = ?", (sender_id,)).fetchone():
+                return f"{sender_id}@lid"
+            if conn.execute("SELECT 1 FROM whatsmeow_lid_map WHERE pn = ?", (sender_id,)).fetchone() or conn.execute(
+                "SELECT 1 FROM whatsmeow_contacts WHERE their_jid = ?", (f"{sender_id}@s.whatsapp.net",)
+            ).fetchone():
+                return f"{sender_id}@s.whatsapp.net"
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return sender_id
+
+
+def _csv_safe(value: Any) -> Any:
+    """Keep spreadsheets from reading text cells as formulas."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
+def _write_atomic(path: str, write) -> None:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig" if path.endswith(".csv") else "utf-8", newline="") as f:
+            write(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def _copy_verified(src: str, dst: str, sha256: str) -> bool:
+    """Copy through a temporary name so an interrupted copy never sits under the final name."""
+    part = f"{dst}.part"
+    try:
+        shutil.copy2(src, part)
+        if _sha256(part) != sha256:
+            os.remove(part)
+            return False
+        os.chmod(part, 0o444)
+        os.replace(part, dst)
+        return True
+    except BaseException:
+        if os.path.exists(part):
+            os.remove(part)
+        raise
+
+
+def _move_aside(path: str) -> Dict[str, str]:
+    aside = f"{path}.mismatch-{int(time.time())}"
+    digest = _sha256(path)
+    os.rename(path, aside)
+    return {"file": os.path.basename(aside), "sha256": digest}
+
+
+def _load_manifest(path: str, problems: List[str]) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Entries keyed by (chat_jid, message_id). Entries written by the first version get their
+    chat from the header and the current meaning of caption/forwarded/status."""
+    entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    if not os.path.exists(path):
+        return entries
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except ValueError:
+        aside = f"{path}.corrupt-{int(time.time())}"
+        os.rename(path, aside)
+        problems.append(f"manifest.json could not be read and was moved to {os.path.basename(aside)}; it lists only this run's files now")
+        return entries
+    for entry in data.get("files", []):
+        if data.get("chat_jid"):
+            entry.setdefault("chat_jid", data["chat_jid"])
+            entry.setdefault("chat_name", data.get("chat_name", data["chat_jid"]))
+        if "error" in entry:
+            error = entry.pop("error")
+            if error and not entry.get("status"):
+                entry.update({"status": "failed", "note": error})
+        if entry.get("forwarded") == "":
+            entry["forwarded"] = None
+            if entry.get("caption") == "" and entry.get("media_type") != "audio":
+                entry["caption"] = None
+        if entry.get("sender_id"):
+            entry["sender_id"] = _full_jid(entry["sender_id"])
+        entries[(entry.get("chat_jid", ""), entry["message_id"])] = entry
+    return entries
+
+
+def export_chat_media(
+    chat_jid: str,
+    dest_dir: Optional[str] = None,
+    media_types: Optional[List[str]] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    media_retry: bool = True,
+) -> Dict[str, Any]:
+    """Download every media file of a chat through the bridge and, if dest_dir is given,
+    copy the files there (read-only) with a manifest.csv/manifest.json holding the chat, date,
+    sender, caption and SHA-256 of each message. Files already exported are checked, not rewritten;
+    files that went missing or changed are flagged in the manifest and in "problems".
+    dest_dir must be absolute (or start with ~): the server does not run in the caller's directory.
+    """
+    if dest_dir:
+        dest_dir = os.path.expanduser(dest_dir)
+        if not os.path.isabs(dest_dir):
+            return {"success": False, "message": f"dest_dir must be an absolute path, got {dest_dir!r}"}
+
+    payload: Dict[str, Any] = {"chat_jid": chat_jid, "media_retry": media_retry}
+    if media_types:
+        payload["media_types"] = media_types
+    if after:
+        payload["after"] = after
+    if before:
+        payload["before"] = before
+    try:
+        # The bridge answers once every item was tried; downloads go on in the bridge even if this gives up
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/download_chat", json=payload, timeout=(5, 4 * 3600))
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {e}"}
+    if response.status_code != 200:
+        return {"success": False, "message": _bridge_error(response)}
+    result = response.json()
+    if not result.get("success"):
+        return {"success": False, "message": result.get("message", "Unknown error")}
+
+    summary: Dict[str, Any] = {
+        "success": True,
+        "message": result.get("message", ""),
+        "total": result.get("total", 0),
+        "downloaded": result.get("downloaded", 0),
+        "cached": result.get("cached", 0),
+        "failed": result.get("failed", 0),
+        "items": [],
+        "problems": [],
+    }
+    items = result.get("items") or []
+    if not dest_dir:
+        summary["items"] = [
+            {"message_id": it["message_id"], "path": (it.get("media") or {}).get("path"), "error": it.get("error")}
+            for it in items
+        ]
+        return summary
+
+    os.makedirs(dest_dir, exist_ok=True)
+    # One export at a time per folder, so two chats never overwrite each other's manifest rows
+    with open(os.path.join(dest_dir, ".manifest.lock"), "w") as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        _export_into(dest_dir, chat_jid, items, summary)
+
+    summary["dest_dir"] = dest_dir
+    summary["manifest"] = os.path.join(dest_dir, "manifest.json")
+    summary["message"] += f"; {summary['copied']} new files copied to {dest_dir}"
+    if summary["problems"]:
+        summary["message"] += f"; {len(summary['problems'])} problem(s) found in the folder"
+    return summary
+
+
+def _export_into(dest_dir: str, chat_jid: str, items: List[Dict[str, Any]], summary: Dict[str, Any]) -> None:
+    problems: List[str] = summary["problems"]
+    manifest_json = os.path.join(dest_dir, "manifest.json")
+    manifest = _load_manifest(manifest_json, problems)
+
+    captions: Dict[str, str] = {}
+    chat_name = chat_jid
+    conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True)
+    try:
+        ids = [it["message_id"] for it in items]
+        if ids:
+            cursor = conn.execute(
+                f"SELECT id, content FROM messages WHERE chat_jid = ? AND id IN ({','.join('?' * len(ids))})",
+                [chat_jid, *ids],
+            )
+            captions = {row[0]: row[1] or "" for row in cursor.fetchall()}
+        row = conn.execute("SELECT name FROM chats WHERE jid = ?", (chat_jid,)).fetchone()
+        if row and row[0]:
+            chat_name = row[0]
+    finally:
+        conn.close()
+
+    names: Dict[str, str] = {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    summary["copied"] = 0
+    processed = set()
+    try:
+        for it in items:
+            media = it.get("media") or {}
+            message_id = it["message_id"]
+            key = (chat_jid, message_id)
+            entry = dict(manifest.get(key, {}))
+            entry.update({"chat_jid": chat_jid, "chat_name": chat_name, "message_id": message_id})
+            if not it.get("success"):
+                # Keep a file exported earlier; only record the error when nothing was exported
+                if not entry.get("file"):
+                    entry.update({"status": "failed", "note": it.get("error", "unknown error")})
+                    manifest[key] = entry
+                summary["items"].append({"message_id": message_id, "error": it.get("error")})
+                continue
+
+            sender_id = _full_jid(media.get("sender_jid") or media.get("sender") or "")
+            if sender_id not in names:
+                names[sender_id] = "Me" if media.get("is_from_me") else (contact_name(sender_id) or sender_id)
+
+            dst = os.path.join(dest_dir, media["filename"])
+            # Copies in the folder that claim to be this message but no longer match it are kept aside
+            previous = os.path.join(dest_dir, entry["file"]) if entry.get("file") else None
+            match, moved_now = None, []
+            for candidate in dict.fromkeys(p for p in (previous, dst) if p):
+                if not os.path.exists(candidate):
+                    continue
+                if _sha256(candidate) == media["sha256"]:
+                    match = candidate
+                    break
+                moved_now.append(_move_aside(candidate))
+            if match:
+                dst, status = match, "already exported"
+            else:
+                if not _copy_verified(media["path"], dst, media["sha256"]):
+                    entry.update({"status": "failed", "note": "copy does not match the downloaded file"})
+                    manifest[key] = entry
+                    summary["items"].append({"message_id": message_id, "error": entry["note"]})
+                    continue
+                summary["copied"] += 1
+                status = "replaced" if moved_now else "exported"
+            note = ""
+            if moved_now:
+                note = "copy in the folder did not match the message; moved to " + ", ".join(m["file"] for m in moved_now)
+                entry["replaced_at"] = now
+                problems.append(f"{message_id}: {note}")
+            moved = list(entry.get("moved_aside") or []) + moved_now
+
+            timestamp = datetime.fromisoformat(media["timestamp"].replace("Z", "+00:00")).astimezone()
+            stored_before_patch = media.get("is_forwarded") is None
+            caption = captions.get(message_id, "")
+            entry.update({
+                "timestamp": timestamp.isoformat(timespec="seconds"),
+                "sender": names[sender_id],
+                "sender_id": sender_id,
+                "from_me": bool(media.get("is_from_me")),
+                "media_type": media.get("media_type", ""),
+                "mime_type": media.get("mime_type", ""),
+                "duration_s": media.get("duration") or (_media_duration(dst) if media.get("media_type") in ("audio", "video") else ""),
+                # null when the bridge that stored the message did not record it
+                "forwarded": None if stored_before_patch else bool(media["is_forwarded"]),
+                # Only photos, videos and documents carry captions
+                "caption": None if stored_before_patch and not caption and media.get("media_type") != "audio" else caption,
+                "original_name": media.get("original_name", ""),
+                "file": os.path.basename(dst),
+                "size": media.get("size", 0),
+                "sha256": media["sha256"],
+                "media_retry": bool(media.get("media_retry")),
+                "status": status,
+                "note": note,
+                "moved_aside": moved,
+            })
+            entry.setdefault("exported_at", now)
+            manifest[key] = entry
+            processed.add(key)
+            summary["items"].append({"message_id": message_id, "file": dst, "sha256": media["sha256"], "status": status, "note": note})
+    finally:
+        # Every listed file must still be in the folder with the recorded hash. Files handled in
+        # this run were just checked; the others (earlier runs, other chats) are checked here.
+        for key, entry in manifest.items():
+            if not entry.get("file") or key in processed:
+                continue
+            path = os.path.join(dest_dir, entry["file"])
+            try:
+                if not os.path.exists(path):
+                    entry.update({"status": "missing", "note": "file no longer in the folder"})
+                elif _sha256(path) != entry.get("sha256"):
+                    entry.update({"status": "altered", "note": "file content differs from the recorded SHA-256"})
+                elif entry.get("status") in ("missing", "altered", "unreadable"):
+                    entry.update({"status": "already exported", "note": ""})
+            except OSError as e:
+                entry.update({"status": "unreadable", "note": f"could not read the file: {e}"})
+            if entry.get("status") in ("missing", "altered", "unreadable"):
+                problems.append(f"{entry['message_id']} ({entry['file']}): {entry['note']}")
+
+        files = sorted(manifest.values(), key=lambda e: (e.get("timestamp", ""), e.get("chat_jid", ""), e["message_id"]))
+        chats = {e.get("chat_jid", ""): e.get("chat_name", "") for e in files}
+        _write_atomic(manifest_json, lambda f: json.dump(
+            {"updated_at": now, "chats": chats, "files": files}, f, ensure_ascii=False, indent=2))
+
+        def write_csv(f):
+            writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            for e in files:
+                row = {k: _csv_safe(v) for k, v in e.items()}
+                if e.get("caption") is None and e.get("file") and e.get("media_type") != "audio":
+                    row["caption"] = CAPTION_UNKNOWN
+                if e.get("forwarded") is None:
+                    row["forwarded"] = ""
+                row["moved_aside"] = "; ".join(f"{m['file']} ({m['sha256'][:12]})" for m in e.get("moved_aside") or [])
+                writer.writerow(row)
+        _write_atomic(os.path.join(dest_dir, "manifest.csv"), write_csv)

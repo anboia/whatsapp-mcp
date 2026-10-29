@@ -1,0 +1,178 @@
+#!/bin/zsh
+# Controls the WhatsApp MCP bridge as a macOS background service (launchd).
+# Usage: wa start | stop | restart | status | qr | logs | media | history | auto
+
+LABEL="local.whatsapp-bridge"
+DOMAIN="gui/$(id -u)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+# Resolved through symlinks, so `ln -s "$PWD/wa" ~/.local/bin/wa` works
+REPO_DIR="${0:A:h}"
+BRIDGE_DIR="$REPO_DIR/whatsapp-bridge"
+STORE="$BRIDGE_DIR/store"
+LOG="$HOME/Library/Logs/whatsapp-bridge.log"
+PORT="${WHATSAPP_BRIDGE_PORT:-8741}"
+SERVER_DIR="$REPO_DIR/whatsapp-mcp-server"
+AUTO="$STORE/autodownload.txt"
+
+write_plist() {
+  mkdir -p "${PLIST:h}"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$BRIDGE_DIR/whatsapp-bridge</string></array>
+  <key>WorkingDirectory</key><string>$BRIDGE_DIR</string>
+  <key>EnvironmentVariables</key><dict><key>WHATSAPP_BRIDGE_PORT</key><string>$PORT</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+EOF
+}
+
+is_loaded() { launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; }
+
+build_bridge() {
+  echo "Building the bridge..."
+  (cd "$BRIDGE_DIR" && go build -o whatsapp-bridge .)
+}
+
+# JIDs in autodownload.txt, read the way the bridge reads them (comments and spaces stripped)
+auto_jids() {
+  [[ -f "$AUTO" ]] || return 0
+  awk '{sub(/#.*/,""); gsub(/^[ \t\r]+|[ \t\r]+$/,""); if ($0!="") print}' "$AUTO"
+}
+
+case "$1" in
+  start)
+    [[ -x "$BRIDGE_DIR/whatsapp-bridge" ]] || build_bridge || exit 1
+    [[ -f "$PLIST" ]] || write_plist
+    launchctl enable "$DOMAIN/$LABEL"
+    if is_loaded; then
+      launchctl kickstart "$DOMAIN/$LABEL"
+    else
+      launchctl bootstrap "$DOMAIN" "$PLIST"
+    fi
+    echo "Bridge started (it also starts at login). Check it with: wa status"
+    ;;
+  stop)
+    is_loaded && launchctl bootout "$DOMAIN/$LABEL"
+    launchctl disable "$DOMAIN/$LABEL"
+    echo "Bridge stopped (it won't start at login until you run: wa start)"
+    ;;
+  restart)
+    "$0" stop >/dev/null; sleep 1; "$0" start
+    ;;
+  build)
+    # Rebuild after pulling changes, then: wa restart
+    build_bridge
+    ;;
+  status)
+    pid=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk '/^\tpid =/ {print $3}')
+    if [[ -n "$pid" ]]; then echo "Service:   running (pid $pid)"
+    elif is_loaded; then echo "Service:   loaded but no process (restarting?)"
+    else echo "Service:   STOPPED  → wa start"; fi
+
+    if [[ -f "$STORE/qr.png" ]]; then
+      echo "WhatsApp:  waiting for a QR code scan  → wa qr"
+    elif api=$(curl -s --max-time 2 "http://127.0.0.1:$PORT/api/status"); then
+      [[ "$api" == *'"connected":true'* && "$api" == *'"logged_in":true'* ]] \
+        && echo "WhatsApp:  connected ✓" \
+        || echo "WhatsApp:  disconnected ($api) → wa logs"
+    else
+      echo "WhatsApp:  API not answering on port $PORT"
+    fi
+
+    if [[ -f "$STORE/messages.db" ]]; then
+      sqlite3 "$STORE/messages.db" \
+        "select 'Database:  ' || (select count(*) from chats) || ' chats, ' || (select count(*) from messages) || ' messages (latest: ' || ifnull((select max(timestamp) from messages),'—') || ')';"
+    fi
+    ;;
+  qr)
+    if [[ -f "$STORE/qr.png" ]]; then
+      open "$BRIDGE_DIR/qr.html"
+    else
+      echo "No pending QR code (already paired, or the bridge is stopped). Check: wa status"
+    fi
+    ;;
+  logs)
+    tail -n 50 -f "$LOG"
+    ;;
+  media)
+    # wa media <chat_jid> [folder] [--types audio,image] [--after ISO] [--before ISO]
+    if [[ -z "$2" ]]; then
+      echo "Usage: wa media <chat_jid> [folder] [--types audio,image,video,document] [--after 2026-09-24T00:00:00-03:00] [--before ISO] [--no-retry]"
+      exit 1
+    fi
+    shift
+    UV="$(command -v uv || echo "$HOME/.local/bin/uv")"
+    # --project keeps the current directory, so a relative folder means what the user expects
+    "$UV" run --project "$SERVER_DIR" --quiet "$SERVER_DIR/export_media.py" "$@"
+    ;;
+  history)
+    # Asks the phone for the chat's recent history (fills captions and details of older messages)
+    count="${3:-100}"
+    if [[ ! "$2" =~ '^[0-9A-Za-z.:_-]+@[a-z.]+$' || ! "$count" =~ '^[1-9][0-9]{0,2}$' ]] || (( count > 500 )); then
+      echo "Usage: wa history <chat_jid> [count from 1 to 500]"
+      exit 1
+    fi
+    curl -sS --fail-with-body --max-time 60 -X POST "http://127.0.0.1:$PORT/api/backfill" \
+      -H 'Content-Type: application/json' \
+      -d "{\"chat_jid\":\"$2\",\"count\":$count}"
+    rc=$?
+    echo
+    exit $rc
+    ;;
+  auto)
+    # Chats whose new media is downloaded as soon as it arrives
+    case "$2" in
+      add)
+        [[ -z "$3" ]] && { echo "Usage: wa auto add <chat_jid>"; exit 1; }
+        mkdir -p "$STORE"
+        if auto_jids | grep -qxF "$3"; then
+          echo "Already enabled for $3"
+        else
+          # A hand-edited file may lack the final newline
+          # $(...) drops a trailing newline, so a non-empty result means the last byte isn't one
+          [[ -s "$AUTO" && -n "$(tail -c1 "$AUTO")" ]] && print >> "$AUTO"
+          print -r -- "$3" >> "$AUTO"
+          echo "New media from $3 will be downloaded automatically"
+        fi
+        ;;
+      rm)
+        [[ -z "$3" ]] && { echo "Usage: wa auto rm <chat_jid>"; exit 1; }
+        if ! auto_jids | grep -qxF "$3"; then
+          echo "Was not enabled for $3"
+          exit 1
+        fi
+        # Same normalization as the bridge: comments and surrounding spaces don't count
+        awk -v j="$3" '{l=$0; sub(/#.*/,"",l); gsub(/^[ \t\r]+|[ \t\r]+$/,"",l); if (l!=j) print}' "$AUTO" > "$AUTO.tmp" \
+          && mv -f "$AUTO.tmp" "$AUTO" && echo "Removed: $3"
+        ;;
+      ""|list)
+        if [[ -s "$AUTO" ]]; then
+          echo "Automatic media download is enabled for:"
+          auto_jids | while IFS= read -r jid; do
+            name=$(sqlite3 -readonly "$STORE/messages.db" "select name from chats where jid='${jid//\'/}'" 2>/dev/null)
+            echo "  $jid  ${name}"
+          done
+        else
+          echo "No chat has automatic media download. Enable one with: wa auto add <chat_jid>"
+        fi
+        ;;
+      *)
+        echo "Usage: wa auto [list] | wa auto add <chat_jid> | wa auto rm <chat_jid>"
+        exit 1
+        ;;
+    esac
+    ;;
+  *)
+    echo "Usage: wa start | stop | restart | build | status | qr | logs | media | history | auto"
+    exit 1
+    ;;
+esac
